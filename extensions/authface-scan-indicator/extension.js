@@ -1,5 +1,6 @@
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import Cairo from 'cairo';
 import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
@@ -7,7 +8,12 @@ import St from 'gi://St';
 
 const STATUS_FILENAME = 'face-auth-status';
 const RESULT_SHOW_MS = 1800;
+// face-auth exits as soon as it matches and GNOME unlocks immediately, so the
+// success animation is finished over the fading lock screen instead.
+const UNLOCK_SHOW_MS = 900;
 const STALE_SCAN_MS = 10000;
+const RESULT_ANIM_MS = 550;
+const GLYPH_SIZE = 96;
 
 // Session modes in which the unlock UI is on screen. GNOME has no mode called
 // 'lock' — the shield is 'lock-screen' and the password/unlock prompt is
@@ -15,50 +21,149 @@ const STALE_SCAN_MS = 10000;
 // appeared.
 const LOCKED_MODES = ['unlock-dialog', 'lock-screen'];
 
+const WHITE = [1.0, 1.0, 1.0];
+const CYAN = [0.30, 0.82, 0.88];
+const GREEN = [0.20, 0.78, 0.35];
+const RED = [1.0, 0.27, 0.23];
+
+const LABELS = {
+    scanning: 'Scanning face…',
+    ok: 'Face recognised',
+    fail: 'Face not recognised — use your password',
+};
+
+function setColor(cr, [r, g, b], a = 1) {
+    cr.setSourceRGBA(r, g, b, a);
+}
+
+function easeOutCubic(p) {
+    return 1 - Math.pow(1 - p, 3);
+}
+
+// All drawing is in a 100×100 box, scaled to the actor in _draw().
+
+/// Four rounded corner brackets, Face ID style. `inset` pulls them inwards.
+function drawCorners(cr, inset) {
+    const a = 8 + inset, b = 92 - inset, r = 14, len = 14;
+    cr.newPath();
+    cr.moveTo(a, a + r + len);
+    cr.lineTo(a, a + r);
+    cr.arc(a + r, a + r, r, Math.PI, 1.5 * Math.PI);
+    cr.lineTo(a + r + len, a);
+
+    cr.moveTo(b - r - len, a);
+    cr.lineTo(b - r, a);
+    cr.arc(b - r, a + r, r, 1.5 * Math.PI, 2 * Math.PI);
+    cr.lineTo(b, a + r + len);
+
+    cr.moveTo(b, b - r - len);
+    cr.lineTo(b, b - r);
+    cr.arc(b - r, b - r, r, 0, 0.5 * Math.PI);
+    cr.lineTo(b - r - len, b);
+
+    cr.moveTo(a + r + len, b);
+    cr.lineTo(a + r, b);
+    cr.arc(a + r, b - r, r, 0.5 * Math.PI, Math.PI);
+    cr.lineTo(a, b - r - len);
+    cr.stroke();
+}
+
+/// Eyes, nose and mouth. `smile` is 1 for a smile, negative for a frown.
+function drawFace(cr, smile = 1) {
+    cr.newPath();
+    cr.moveTo(36, 37);
+    cr.lineTo(36, 45);
+    cr.moveTo(64, 37);
+    cr.lineTo(64, 45);
+    cr.moveTo(51, 37);
+    cr.lineTo(51, 56);
+    cr.lineTo(46, 56);
+    const y = smile >= 0 ? 66 : 70;
+    const dip = 7 * smile;
+    cr.moveTo(36, y);
+    cr.curveTo(43, y + dip, 57, y + dip, 64, y);
+    cr.stroke();
+}
+
+/// Stroke the polyline `points` up to `fraction` of its length.
+function drawPartialPath(cr, points, fraction) {
+    const segments = [];
+    let total = 0;
+    for (let i = 1; i < points.length; i++) {
+        const [x0, y0] = points[i - 1], [x1, y1] = points[i];
+        const length = Math.hypot(x1 - x0, y1 - y0);
+        segments.push([x0, y0, x1, y1, length]);
+        total += length;
+    }
+
+    let remaining = total * fraction;
+    cr.newPath();
+    cr.moveTo(points[0][0], points[0][1]);
+    for (const [x0, y0, x1, y1, length] of segments) {
+        if (remaining <= 0)
+            break;
+        const f = Math.min(1, remaining / length);
+        cr.lineTo(x0 + (x1 - x0) * f, y0 + (y1 - y0) * f);
+        remaining -= length;
+    }
+    cr.stroke();
+}
+
 export default class AuthFaceScanIndicator extends Extension {
     enable() {
         this._monitor = null;
         this._monitorChangedId = null;
         this._hideTimeoutId = null;
         this._staleTimeoutId = null;
-        this._pulseStop = false;
-        this._scanningShown = false;
-        this._resultShown = false;
-        this._scanStart = 0;
+        this._state = null;
+        this._stateStart = 0;
+        this._wasLocked = false;
 
-        this._icon = new St.Icon({
-            icon_name: 'camera-photo-symbolic',
-            icon_size: 24,
-            y_align: Clutter.ActorAlign.CENTER,
+        this._area = new St.DrawingArea({
+            width: GLYPH_SIZE,
+            height: GLYPH_SIZE,
+            x_align: Clutter.ActorAlign.CENTER,
         });
+        this._repaintId = this._area.connect('repaint', area => this._draw(area));
+
         this._label = new St.Label({
             text: '',
-            y_align: Clutter.ActorAlign.CENTER,
+            x_align: Clutter.ActorAlign.CENTER,
         });
+        this._label.set_style('font-size: 15px; font-weight: 600; color: #ffffff;');
 
         this._box = new St.BoxLayout({
             reactive: false,
-            style: 'spacing: 10px;',
+            style: 'spacing: 14px;',
             x_align: Clutter.ActorAlign.CENTER,
-            y_align: Clutter.ActorAlign.CENTER,
         });
-        this._box.add_child(this._icon);
+        // `orientation` replaced `vertical` in GNOME 48.
+        if ('orientation' in this._box)
+            this._box.orientation = Clutter.Orientation.VERTICAL;
+        else
+            this._box.vertical = true;
+        this._box.add_child(this._area);
         this._box.add_child(this._label);
 
         this._actor = new St.Bin({
             reactive: false,
             visible: false,
             style: `
-                background-color: rgba(0, 0, 0, 0.66);
-                border-radius: 20px;
-                border: 1px solid rgba(255, 255, 255, 0.18);
-                padding: 10px 22px;
+                background-color: rgba(0, 0, 0, 0.55);
+                border-radius: 28px;
+                border: 1px solid rgba(255, 255, 255, 0.14);
+                padding: 20px 28px 16px 28px;
             `,
         });
         this._actor.set_child(this._box);
 
-        this._label.set_style('font-size: 16px; font-weight: 600; color: #ffffff;');
-        this._icon.set_style('color: #ffffff;');
+        // Drives the animation; runs only while the indicator is visible.
+        this._timeline = new Clutter.Timeline({
+            actor: this._area,
+            duration: 1000,
+            repeat_count: -1,
+        });
+        this._frameId = this._timeline.connect('new-frame', () => this._area.queue_repaint());
 
         Main.uiGroup.add_child(this._actor);
 
@@ -76,7 +181,6 @@ export default class AuthFaceScanIndicator extends Extension {
         this._stopWatching();
         this._clearHideTimeout();
         this._clearStaleTimeout();
-        this._stopPulse();
 
         if (this._modeId) {
             Main.sessionMode.disconnect(this._modeId);
@@ -85,6 +189,15 @@ export default class AuthFaceScanIndicator extends Extension {
         if (this._monitorsId) {
             Main.layoutManager.disconnect(this._monitorsId);
             this._monitorsId = null;
+        }
+        if (this._timeline) {
+            this._timeline.stop();
+            this._timeline.disconnect(this._frameId);
+            this._timeline = null;
+        }
+        if (this._area) {
+            this._area.disconnect(this._repaintId);
+            this._area = null;
         }
         if (this._actor) {
             if (this._notifyId) {
@@ -95,7 +208,6 @@ export default class AuthFaceScanIndicator extends Extension {
             this._actor.destroy();
             this._actor = null;
         }
-        this._icon = null;
         this._label = null;
         this._box = null;
     }
@@ -157,14 +269,25 @@ export default class AuthFaceScanIndicator extends Extension {
     }
 
     _onModeChanged() {
-        if (this._isLocked()) {
+        const locked = this._isLocked();
+        const wasLocked = this._wasLocked;
+        this._wasLocked = locked;
+
+        if (locked) {
             this._startWatching();
-        } else {
-            this._stopWatching();
-            this._scanStart = 0;
-            this._hide();
-            this._unlinkStatus();
+            return;
         }
+
+        this._stopWatching();
+        // Just unlocked by face: the 'ok' may have landed after the last file
+        // event was delivered, so check once more and let the check mark
+        // finish over the fading lock screen.
+        if (wasLocked && (this._state === 'ok' || this._readStatus() === 'ok')) {
+            this._showResult(true, UNLOCK_SHOW_MS);
+            return;
+        }
+        this._hide();
+        this._unlinkStatus();
     }
 
     _onStatusChanged() {
@@ -180,12 +303,9 @@ export default class AuthFaceScanIndicator extends Extension {
         }
 
         if (status === 'scanning') {
-            if (this._scanStart === 0)
-                this._scanStart = GLib.get_monotonic_time() / 1000;
             this._showScanning();
             this._armStaleTimeout();
         } else if (status === 'ok' || status === 'fail') {
-            this._scanStart = 0;
             this._clearStaleTimeout();
             this._showResult(status === 'ok');
         }
@@ -198,7 +318,6 @@ export default class AuthFaceScanIndicator extends Extension {
         this._staleTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, STALE_SCAN_MS, () => {
             this._staleTimeoutId = null;
             if (this._readStatus() === 'scanning') {
-                this._scanStart = 0;
                 this._unlinkStatus();
                 this._hide();
             }
@@ -206,37 +325,31 @@ export default class AuthFaceScanIndicator extends Extension {
         });
     }
 
-    _showScanning() {
-        if (this._resultShown || this._scanningShown)
-            return;
-        this._scanningShown = true;
-        this._resultShown = false;
-
-        this._label.set_text('Scanning face…');
-        this._icon.icon_name = 'camera-photo-symbolic';
-        this._icon.set_style('color: #4dd0e1;');
+    _setState(state) {
+        this._state = state;
+        this._stateStart = GLib.get_monotonic_time() / 1000;
+        this._label.set_text(LABELS[state]);
         this._actor.visible = true;
         this._place();
-        this._startPulse();
+        if (!this._timeline.is_playing())
+            this._timeline.start();
+        this._area.queue_repaint();
     }
 
-    _showResult(success) {
-        this._scanningShown = false;
-        this._stopPulse();
-        if (this._resultShown)
+    _showScanning() {
+        // A result on screen wins over a late 'scanning' event.
+        if (this._state !== null)
             return;
-        this._resultShown = true;
+        this._setState('scanning');
+    }
 
-        this._label.set_text(
-            success ? 'Face recognised' : 'Face not recognised — use your password'
-        );
-        this._icon.icon_name = success ? 'object-select-symbolic' : 'dialog-error-symbolic';
-        this._icon.set_style(success ? 'color: #81c784;' : 'color: #e57373;');
-        this._actor.visible = true;
-        this._place();
+    _showResult(success, holdMs = RESULT_SHOW_MS) {
+        const state = success ? 'ok' : 'fail';
+        if (this._state !== state)
+            this._setState(state);
 
         this._clearHideTimeout();
-        this._hideTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, RESULT_SHOW_MS, () => {
+        this._hideTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, holdMs, () => {
             this._hideTimeoutId = null;
             this._hide();
             this._unlinkStatus();
@@ -244,36 +357,81 @@ export default class AuthFaceScanIndicator extends Extension {
         });
     }
 
-    _startPulse() {
-        this._pulseStop = false;
-        const tick = visible => {
-            if (this._pulseStop || !this._actor)
-                return;
-            this._actor.ease_property('opacity', visible ? 255 : 120, {
-                duration: 450,
-                mode: Clutter.AnimationMode.EASE_IN_OUT_SINE,
-                onComplete: () => tick(!visible),
-            });
-        };
-        this._actor.opacity = 255;
-        tick(true);
-    }
-
-    _stopPulse() {
-        this._pulseStop = true;
-        if (this._actor) {
-            this._actor.remove_all_transitions();
-            this._actor.opacity = 255;
-        }
-    }
-
     _hide() {
-        this._scanningShown = false;
-        this._resultShown = false;
+        this._state = null;
         this._clearHideTimeout();
-        this._stopPulse();
+        if (this._timeline)
+            this._timeline.stop();
         if (this._actor)
             this._actor.visible = false;
+    }
+
+    _draw(area) {
+        const cr = area.get_context();
+        const [width, height] = area.get_surface_size();
+        const elapsedMs = GLib.get_monotonic_time() / 1000 - this._stateStart;
+        const t = elapsedMs / 1000;
+
+        cr.scale(width / 100, height / 100);
+        cr.setLineCap(Cairo.LineCap.ROUND);
+        cr.setLineJoin(Cairo.LineJoin.ROUND);
+        cr.setLineWidth(5);
+
+        if (this._state === 'scanning')
+            this._drawScanning(cr, t);
+        else if (this._state === 'ok' || this._state === 'fail')
+            this._drawResult(cr, Math.min(1, elapsedMs / RESULT_ANIM_MS), t, this._state === 'ok');
+
+        cr.$dispose();
+    }
+
+    _drawScanning(cr, t) {
+        // Brackets breathe; a beam sweeps down and up across the face.
+        const pulse = (Math.sin(t * 2 * Math.PI / 1.4) + 1) / 2;
+        setColor(cr, WHITE, 0.55 + 0.45 * pulse);
+        drawCorners(cr, 3 * pulse);
+
+        setColor(cr, WHITE, 0.9);
+        drawFace(cr);
+
+        const y = 50 - 34 * Math.cos(t * 2 * Math.PI / 1.6);
+        const [r, g, b] = CYAN;
+        const beam = new Cairo.LinearGradient(14, 0, 86, 0);
+        beam.addColorStopRGBA(0, r, g, b, 0);
+        beam.addColorStopRGBA(0.5, r, g, b, 0.95);
+        beam.addColorStopRGBA(1, r, g, b, 0);
+        cr.setSource(beam);
+        cr.setLineWidth(3);
+        cr.newPath();
+        cr.moveTo(14, y);
+        cr.lineTo(86, y);
+        cr.stroke();
+    }
+
+    _drawResult(cr, p, t, success) {
+        const e = easeOutCubic(p);
+        const color = success ? GREEN : RED;
+
+        if (!success) {
+            // A decaying head-shake.
+            cr.translate(Math.sin(t * 2 * Math.PI * 7) * 6 * (1 - p), 0);
+        }
+
+        setColor(cr, color);
+        drawCorners(cr, success ? 3 * e : 0);
+
+        if (success) {
+            // The face gives way to a check mark drawn stroke by stroke.
+            if (e < 1) {
+                setColor(cr, color, 1 - e);
+                drawFace(cr);
+            }
+            setColor(cr, color);
+            cr.setLineWidth(6);
+            drawPartialPath(cr, [[32, 52], [45, 65], [70, 37]], e);
+        } else {
+            drawFace(cr, -e);
+        }
     }
 
     _clearHideTimeout() {
@@ -290,14 +448,13 @@ export default class AuthFaceScanIndicator extends Extension {
         }
     }
 
-    /// Centre the bubble near the top of the primary monitor. The previous
-    /// version set only `y`, leaving it pinned to the left edge.
+    /// Centre the card horizontally, above the unlock prompt.
     _place() {
         const monitor = Main.layoutManager.primaryMonitor;
         if (!monitor || !this._actor)
             return;
         const width = this._actor.width;
         this._actor.x = monitor.x + Math.max(0, Math.floor((monitor.width - width) / 2));
-        this._actor.y = monitor.y + 24;
+        this._actor.y = monitor.y + Math.floor(monitor.height * 0.12);
     }
 }
