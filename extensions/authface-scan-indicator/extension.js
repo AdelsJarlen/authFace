@@ -6,7 +6,6 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import St from 'gi://St';
 
-const STATUS_FILENAME = 'face-auth-status';
 const RESULT_SHOW_MS = 1800;
 // face-auth exits as soon as it matches and GNOME unlocks immediately, so the
 // success animation is finished over the fading lock screen instead.
@@ -24,9 +23,9 @@ const GLYPH_SIZE = 96;
 // appeared. 'gdm' is the login screen.
 const LOCKED_MODES = ['unlock-dialog', 'lock-screen', 'gdm'];
 
-// The login screen runs as a system user that cannot see /run/user/<uid>, so
-// face-auth mirrors its status here for GDM's PAM stacks.
-const GREETER_STATUS_PATH = '/run/face-auth/status';
+// face-auth writes "<state> <user>" here for every PAM service (sudo, polkit,
+// lock and login screens). Root-owned, created at boot by tmpfiles.d.
+const STATUS_PATH = '/run/face-auth/status';
 
 const WHITE = [1.0, 1.0, 1.0];
 const CYAN = [0.30, 0.82, 0.88];
@@ -183,7 +182,8 @@ export default class AuthFaceScanIndicator extends Extension {
         this._modeId = Main.sessionMode.connect('updated', () => this._onModeChanged());
 
         this._place();
-        this._onModeChanged();
+        this._wasLocked = this._isLocked();
+        this._startWatching();
     }
 
     disable() {
@@ -225,28 +225,18 @@ export default class AuthFaceScanIndicator extends Extension {
         return Main.sessionMode && LOCKED_MODES.includes(Main.sessionMode.currentMode);
     }
 
-    _statusPath() {
-        if (Main.sessionMode.currentMode === 'gdm')
-            return GREETER_STATUS_PATH;
-        return GLib.build_filenamev([GLib.get_user_runtime_dir(), STATUS_FILENAME]);
-    }
-
-    /// Watch the status file for changes instead of polling it ten times a
-    /// second for the whole session.
+    /// Watch the status file for changes instead of polling it.
     _startWatching() {
         if (this._monitor)
             return;
         try {
-            const file = Gio.File.new_for_path(this._statusPath());
+            const file = Gio.File.new_for_path(STATUS_PATH);
             this._monitor = file.monitor_file(Gio.FileMonitorFlags.NONE, null);
             this._monitorChangedId = this._monitor.connect('changed', () => this._onStatusChanged());
         } catch (e) {
             logError(e, 'authFace: could not watch scan status file');
             this._monitor = null;
-            return;
         }
-        // The helper may have written before the watch was established.
-        this._onStatusChanged();
     }
 
     _stopWatching() {
@@ -260,67 +250,59 @@ export default class AuthFaceScanIndicator extends Extension {
         }
     }
 
+    /// The current status as {state, user}, or null if absent, empty or stale.
     _readStatus() {
         try {
-            // The greeter's status file cannot be unlinked by this user, so a
-            // result from before a logout is still there; ignore stale ones.
-            const info = Gio.File.new_for_path(this._statusPath())
+            // The file is root-owned and never removed, so the result of an
+            // earlier attempt or session is still there; ignore stale ones.
+            const info = Gio.File.new_for_path(STATUS_PATH)
                 .query_info('time::modified', Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS, null);
             const modified = info.get_modification_date_time();
             const ageMs = GLib.DateTime.new_now_utc().difference(modified) / 1000;
             if (ageMs > STATUS_MAX_AGE_MS)
                 return null;
 
-            const [ok, contents] = GLib.file_get_contents(this._statusPath());
+            const [ok, contents] = GLib.file_get_contents(STATUS_PATH);
             if (!ok || contents === null || contents.length === 0)
                 return null;
-            return new TextDecoder().decode(contents).trim();
+            const [state, user = null] = new TextDecoder().decode(contents).trim().split(/\s+/);
+            return state ? {state, user} : null;
         } catch (e) {
             return null;
         }
     }
 
-    _unlinkStatus() {
-        try {
-            Gio.File.new_for_path(this._statusPath()).delete(null);
-        } catch (e) {
-            /* already gone */
-        }
+    /// The login screen shows scans for any account; a session only its own.
+    _isForThisSession(status) {
+        if (Main.sessionMode.currentMode === 'gdm')
+            return true;
+        return status.user === null || status.user === GLib.get_user_name();
     }
 
     _onModeChanged() {
         const locked = this._isLocked();
         const wasLocked = this._wasLocked;
         this._wasLocked = locked;
-
-        if (locked) {
-            this._startWatching();
+        if (locked || !wasLocked)
             return;
-        }
 
-        this._stopWatching();
         // Just unlocked by face: the 'ok' may have landed after the last file
         // event was delivered, so check once more and let the check mark
         // finish over the fading lock screen.
-        if (wasLocked && (this._state === 'ok' || this._readStatus() === 'ok')) {
+        if (this._state === 'ok' || this._readStatus()?.state === 'ok') {
             this._showResult('ok', UNLOCK_SHOW_MS);
             return;
         }
         this._hide();
-        this._unlinkStatus();
     }
 
     _onStatusChanged() {
-        if (!this._isLocked()) {
-            this._hide();
+        // An empty read is the moment between truncate and write; the write
+        // that follows brings its own event.
+        const current = this._readStatus();
+        if (current === null || !this._isForThisSession(current))
             return;
-        }
-
-        const status = this._readStatus();
-        if (status === null) {
-            this._hide();
-            return;
-        }
+        const status = current.state;
 
         if (status === 'scanning') {
             this._showScanning();
@@ -340,10 +322,8 @@ export default class AuthFaceScanIndicator extends Extension {
         this._clearStaleTimeout();
         this._staleTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, STALE_SCAN_MS, () => {
             this._staleTimeoutId = null;
-            if (this._readStatus() === 'scanning') {
-                this._unlinkStatus();
+            if (this._readStatus()?.state === 'scanning')
                 this._hide();
-            }
             return GLib.SOURCE_REMOVE;
         });
     }
@@ -353,6 +333,8 @@ export default class AuthFaceScanIndicator extends Extension {
         this._stateStart = GLib.get_monotonic_time() / 1000;
         this._label.set_text(LABELS[state]);
         this._actor.visible = true;
+        // Stay above modal dialogs such as the polkit password prompt.
+        Main.uiGroup.set_child_above_sibling(this._actor, null);
         this._place();
         if (!this._timeline.is_playing())
             this._timeline.start();
@@ -360,8 +342,8 @@ export default class AuthFaceScanIndicator extends Extension {
     }
 
     _showScanning() {
-        // A result on screen wins over a late 'scanning' event.
-        if (this._state !== null)
+        // A new attempt replaces a failure still on screen; a success stays.
+        if (this._state === 'scanning' || this._state === 'ok')
             return;
         this._setState('scanning');
     }
@@ -374,7 +356,6 @@ export default class AuthFaceScanIndicator extends Extension {
         this._hideTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, holdMs, () => {
             this._hideTimeoutId = null;
             this._hide();
-            this._unlinkStatus();
             return GLib.SOURCE_REMOVE;
         });
     }
