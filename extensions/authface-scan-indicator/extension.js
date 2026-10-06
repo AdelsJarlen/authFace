@@ -12,24 +12,33 @@ const RESULT_SHOW_MS = 1800;
 // success animation is finished over the fading lock screen instead.
 const UNLOCK_SHOW_MS = 900;
 const STALE_SCAN_MS = 10000;
+// Statuses older than this are leftovers from an earlier attempt or session.
+const STATUS_MAX_AGE_MS = 15000;
+const PAUSED_SHOW_MS = 3500;
 const RESULT_ANIM_MS = 550;
 const GLYPH_SIZE = 96;
 
 // Session modes in which the unlock UI is on screen. GNOME has no mode called
 // 'lock' — the shield is 'lock-screen' and the password/unlock prompt is
 // 'unlock-dialog'. Testing for 'lock' matched nothing, so the indicator never
-// appeared.
-const LOCKED_MODES = ['unlock-dialog', 'lock-screen'];
+// appeared. 'gdm' is the login screen.
+const LOCKED_MODES = ['unlock-dialog', 'lock-screen', 'gdm'];
+
+// The login screen runs as a system user that cannot see /run/user/<uid>, so
+// face-auth mirrors its status here for GDM's PAM stacks.
+const GREETER_STATUS_PATH = '/run/face-auth/status';
 
 const WHITE = [1.0, 1.0, 1.0];
 const CYAN = [0.30, 0.82, 0.88];
 const GREEN = [0.20, 0.78, 0.35];
 const RED = [1.0, 0.27, 0.23];
+const AMBER = [1.0, 0.72, 0.18];
 
 const LABELS = {
     scanning: 'Scanning face…',
     ok: 'Face recognised',
     fail: 'Face not recognised — use your password',
+    paused: 'Face unlock paused — use fingerprint or password',
 };
 
 function setColor(cr, [r, g, b], a = 1) {
@@ -217,6 +226,8 @@ export default class AuthFaceScanIndicator extends Extension {
     }
 
     _statusPath() {
+        if (Main.sessionMode.currentMode === 'gdm')
+            return GREETER_STATUS_PATH;
         return GLib.build_filenamev([GLib.get_user_runtime_dir(), STATUS_FILENAME]);
     }
 
@@ -251,6 +262,15 @@ export default class AuthFaceScanIndicator extends Extension {
 
     _readStatus() {
         try {
+            // The greeter's status file cannot be unlinked by this user, so a
+            // result from before a logout is still there; ignore stale ones.
+            const info = Gio.File.new_for_path(this._statusPath())
+                .query_info('time::modified', Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS, null);
+            const modified = info.get_modification_date_time();
+            const ageMs = GLib.DateTime.new_now_utc().difference(modified) / 1000;
+            if (ageMs > STATUS_MAX_AGE_MS)
+                return null;
+
             const [ok, contents] = GLib.file_get_contents(this._statusPath());
             if (!ok || contents === null || contents.length === 0)
                 return null;
@@ -283,7 +303,7 @@ export default class AuthFaceScanIndicator extends Extension {
         // event was delivered, so check once more and let the check mark
         // finish over the fading lock screen.
         if (wasLocked && (this._state === 'ok' || this._readStatus() === 'ok')) {
-            this._showResult(true, UNLOCK_SHOW_MS);
+            this._showResult('ok', UNLOCK_SHOW_MS);
             return;
         }
         this._hide();
@@ -307,7 +327,10 @@ export default class AuthFaceScanIndicator extends Extension {
             this._armStaleTimeout();
         } else if (status === 'ok' || status === 'fail') {
             this._clearStaleTimeout();
-            this._showResult(status === 'ok');
+            this._showResult(status);
+        } else if (status === 'paused') {
+            this._clearStaleTimeout();
+            this._showResult(status, PAUSED_SHOW_MS);
         }
     }
 
@@ -343,8 +366,7 @@ export default class AuthFaceScanIndicator extends Extension {
         this._setState('scanning');
     }
 
-    _showResult(success, holdMs = RESULT_SHOW_MS) {
-        const state = success ? 'ok' : 'fail';
+    _showResult(state, holdMs = RESULT_SHOW_MS) {
         if (this._state !== state)
             this._setState(state);
 
@@ -381,6 +403,8 @@ export default class AuthFaceScanIndicator extends Extension {
             this._drawScanning(cr, t);
         else if (this._state === 'ok' || this._state === 'fail')
             this._drawResult(cr, Math.min(1, elapsedMs / RESULT_ANIM_MS), t, this._state === 'ok');
+        else if (this._state === 'paused')
+            this._drawPaused(cr, Math.min(1, elapsedMs / RESULT_ANIM_MS));
 
         cr.$dispose();
     }
@@ -432,6 +456,31 @@ export default class AuthFaceScanIndicator extends Extension {
         } else {
             drawFace(cr, -e);
         }
+    }
+
+    _drawPaused(cr, p) {
+        // Amber, expressionless face with a pause badge fading in.
+        const e = easeOutCubic(p);
+        setColor(cr, AMBER);
+        drawCorners(cr, 0);
+        drawFace(cr, 0);
+
+        // Cut a gap in the bracket so the badge stands clear of it.
+        cr.save();
+        cr.setOperator(Cairo.Operator.CLEAR);
+        cr.newPath();
+        cr.arc(80, 80, 19 * e, 0, 2 * Math.PI);
+        cr.fill();
+        cr.restore();
+
+        setColor(cr, AMBER, e);
+        cr.newPath();
+        cr.arc(80, 80, 14, 0, 2 * Math.PI);
+        cr.fill();
+        cr.setSourceRGBA(0, 0, 0, 0.85 * e);
+        cr.rectangle(74, 73, 4, 14);
+        cr.rectangle(82, 73, 4, 14);
+        cr.fill();
     }
 
     _clearHideTimeout() {

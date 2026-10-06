@@ -1,7 +1,7 @@
 {
   "uuid": "authface-scan-indicator@samvivan.local",
   "name": "authFace Scan Indicator",
-  "description": "Shows authFace face-scan status (scanning / recognised / not recognised) on the GNOME lock screen.",
+  "description": "Face ID-style authFace scan animation on the GNOME lock and login screens.",
   "shell-version": [
     "45",
     "46",
@@ -12,8 +12,9 @@
   ],
   "session-modes": [
     "user",
-    "unlock-dialog"
+    "unlock-dialog",
+    "gdm"
   ],
   "url": "https://github.com/pfalkingham/authFace",
-  "version-name": "1.2.0"
+  "version-name": "1.3.0"
 }
