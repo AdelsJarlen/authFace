@@ -12,6 +12,8 @@
 #                                   device present on this machine
 #   scan_duration_ms, scan_interval_ms, capture_timeout_ms
 #                                   honoured within built-in bounds
+#   max_failures                    honoured only if lower than the value
+#                                   set here (or if the limit is off here)
 #   model_path, detector_model_path, embeddings_dir
 #                                   ignored — system policy only
 #
@@ -60,3 +62,11 @@ scan_duration_ms = 5000
 # camera and by inference, so it cannot spin. Raise it only to trade unlock
 # speed for CPU.
 scan_interval_ms = 0
+
+# Consecutive failed face scans before face unlock pauses (0 - 100, default 3,
+# 0 = no limit). While paused, face-auth fails immediately without opening the
+# camera, so the prompt goes straight to fingerprint or password. Any
+# successful authentication — face, fingerprint or password — resets the count,
+# via the `account` line deploy.sh adds to the PAM stacks. Every scan that ends
+# without a match counts, whether or not a face was seen.
+max_failures = 3

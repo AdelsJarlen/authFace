@@ -81,7 +81,7 @@ rm -rf "$GUI_DATA_DIR"
 rm -rf "${XDG_DATA_HOME:-$ACTUAL_HOME/.local/share}/face-auth-gtk"
 
 echo "Restoring PAM configs..."
-for service in sudo swaylock gdm-password; do
+for service in sudo swaylock gdm-password gdm-fingerprint; do
     conf="$PAM_DIR/$service"
     if [ -f "$conf.face-auth.bak" ]; then
         mv "$conf.face-auth.bak" "$conf"
@@ -96,6 +96,14 @@ done
 
 echo "Removing SELinux policy module..."
 semodule -r face_auth 2>/dev/null || true
+
+echo "Removing login-screen indicator and status..."
+rm -rf /usr/share/gnome-shell/extensions/authface-scan-indicator@samvivan.local
+if [ -f /etc/dconf/db/gdm.d/90-authface-scan-indicator ]; then
+    rm -f /etc/dconf/db/gdm.d/90-authface-scan-indicator
+    dconf update 2>/dev/null || true
+fi
+rm -rf /run/face-auth
 
 echo ""
 if [ "$PURGE" = true ]; then

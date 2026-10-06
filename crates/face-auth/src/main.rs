@@ -5,12 +5,13 @@
 //! reads from its environment is attacker-influenced except `PAM_USER`, which
 //! `pam_exec` sets from the PAM handle itself.
 
+use face_auth_core::storage::{read_failures, write_failures};
 use face_auth_core::{user, FaceAuth, FaceAuthConfig};
 use std::env;
-use std::fs::OpenOptions;
+use std::fs::{DirBuilder, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::PathBuf;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tracing_subscriber::{fmt, EnvFilter};
 
@@ -18,6 +19,13 @@ use tracing_subscriber::{fmt, EnvFilter};
 const STATUS_SCANNING: &str = "scanning";
 const STATUS_OK: &str = "ok";
 const STATUS_FAIL: &str = "fail";
+/// Face unlock is locked out until the user authenticates another way.
+const STATUS_PAUSED: &str = "paused";
+
+/// Status location for the GDM login screen. The greeter runs as a system
+/// user that cannot read `/run/user/<uid>`, which does not even exist before
+/// the user's first login after boot.
+const GREETER_STATUS_DIR: &str = "/run/face-auth";
 
 /// Publish scan state to `/run/user/<uid>/face-auth-status` for the lock-screen
 /// indicator extension.
@@ -32,18 +40,43 @@ const STATUS_FAIL: &str = "fail";
 /// the user owns), not on the file.
 fn write_status(info: &user::UserInfo, status: &str) {
     let dir = PathBuf::from(format!("/run/user/{}", info.uid));
-    if !dir.is_dir() {
+    if dir.is_dir() {
+        write_status_file(&dir.join("face-auth-status"), status);
+    }
+    write_greeter_status(status);
+}
+
+/// Mirror the status to `/run/face-auth/status` for the login-screen
+/// indicator. Only GDM's stacks have a greeter to inform, so sudo and the
+/// like never touch it.
+fn write_greeter_status(status: &str) {
+    if !env::var("PAM_SERVICE").is_ok_and(|s| s.starts_with("gdm")) {
         return;
     }
-    let path = dir.join("face-auth-status");
+    let dir = Path::new(GREETER_STATUS_DIR);
+    if let Err(e) = DirBuilder::new().mode(0o755).create(dir) {
+        if e.kind() != std::io::ErrorKind::AlreadyExists {
+            tracing::debug!("could not create {}: {e}", dir.display());
+            return;
+        }
+    }
+    // /run is root-only, so nobody else can have made this; still accept
+    // nothing but a real, root-owned directory.
+    match std::fs::symlink_metadata(dir) {
+        Ok(m) if m.is_dir() && m.uid() == 0 => {}
+        _ => return,
+    }
+    write_status_file(&dir.join("status"), status);
+}
 
+fn write_status_file(path: &Path, status: &str) {
     let result = OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o644)
         .custom_flags(libc::O_NOFOLLOW)
-        .open(&path)
+        .open(path)
         .and_then(|mut f| f.write_all(status.as_bytes()));
 
     if let Err(e) = result {
@@ -176,6 +209,18 @@ fn main() {
         Err(e) => fail_setup(&format!("cannot authenticate '{username}': {e}")),
     };
 
+    // pam_exec in the `account` phase: that runs only once the stack has
+    // authenticated the user by some method — face, fingerprint or password —
+    // so it is where a failed-scan lockout ends.
+    if env::var("PAM_TYPE").as_deref() == Ok("account") {
+        if let Ok(config) = FaceAuthConfig::load_for_auth(&info.name) {
+            if let Err(e) = write_failures(&info.name, &config.embeddings_dir(), 0) {
+                tracing::warn!("could not reset failed-scan counter: {e}");
+            }
+        }
+        std::process::exit(0);
+    }
+
     if let Err(reason) = reject_remote_session() {
         fail_auth(&format!("refusing face authentication for {reason}"));
     }
@@ -188,6 +233,19 @@ fn main() {
 
     let scan_duration = config.scan_duration_ms();
     let scan_interval = config.scan_interval_ms();
+    let embeddings_dir = config.embeddings_dir();
+    let max_failures = config.max_failures();
+
+    // Checked before the models load or the camera opens: once paused, the
+    // stack moves straight on to fingerprint or password.
+    let failures = read_failures(&info.name, &embeddings_dir);
+    if max_failures > 0 && failures >= max_failures {
+        write_status(&info, STATUS_PAUSED);
+        fail_auth(&format!(
+            "face unlock paused for '{}' after {failures} failed scans; authenticate another way to resume",
+            info.name
+        ));
+    }
 
     let mut auth = match FaceAuth::new(config) {
         Ok(a) => a,
@@ -210,12 +268,25 @@ fn main() {
     match result {
         Ok(true) => {
             write_status(&info, STATUS_OK);
+            if failures > 0 {
+                let _ = write_failures(&info.name, &embeddings_dir, 0);
+            }
             std::process::exit(0);
         }
         Ok(false) => {
-            write_status(&info, STATUS_FAIL);
-            fail_auth(&format!("face not recognised for '{}'", info.name));
+            // Every completed scan without a match counts, face seen or not.
+            let failures = failures.saturating_add(1);
+            if let Err(e) = write_failures(&info.name, &embeddings_dir, failures) {
+                tracing::warn!("could not record failed scan: {e}");
+            }
+            let paused = max_failures > 0 && failures >= max_failures;
+            write_status(&info, if paused { STATUS_PAUSED } else { STATUS_FAIL });
+            fail_auth(&format!(
+                "face not recognised for '{}' ({failures} consecutive failure(s))",
+                info.name
+            ));
         }
+        // Camera or model trouble is not an attempt; it does not count.
         Err(e) => {
             write_status(&info, STATUS_FAIL);
             fail_setup(&format!("face authentication error: {e}"));

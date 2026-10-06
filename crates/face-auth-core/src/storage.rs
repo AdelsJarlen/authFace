@@ -142,10 +142,84 @@ impl EmbeddingStore {
     }
 }
 
+/// Consecutive failed face scans, kept beside the user's templates.
+///
+/// Root-owned like the templates: anything that can write this file can lift
+/// its own lockout. A missing or unparsable file counts as zero.
+const FAILURES_FILE: &str = "failures";
+
+pub fn read_failures(user: &str, embeddings_dir: &Path) -> u32 {
+    let Ok(dir) = user_store_dir(user, embeddings_dir) else {
+        return 0;
+    };
+    let mut buf = String::new();
+    let read = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(dir.join(FAILURES_FILE))
+        .and_then(|f| f.take(32).read_to_string(&mut buf));
+    if read.is_err() {
+        return 0;
+    }
+    buf.trim().parse().unwrap_or(0)
+}
+
+/// Record the failure count; zero removes the file. Only for enrolled users:
+/// the per-user directory is never created here.
+pub fn write_failures(user: &str, embeddings_dir: &Path, count: u32) -> anyhow::Result<()> {
+    let dir = user_store_dir(user, embeddings_dir)?;
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    let path = dir.join(FAILURES_FILE);
+
+    if count == 0 {
+        return match fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+            _ => Ok(()),
+        };
+    }
+
+    let tmp_path = dir.join("failures.tmp");
+    {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(EMBEDDINGS_FILE_MODE)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&tmp_path)?;
+        writeln!(file, "{count}")?;
+        file.sync_all()?;
+    }
+    fs::rename(&tmp_path, &path)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn failure_counter_round_trips_and_resets() {
+        let dir = tmpdir("failures");
+
+        // Not enrolled: nothing is created.
+        write_failures("alice", &dir, 2).unwrap();
+        assert!(!dir.join("alice").exists());
+        assert_eq!(read_failures("alice", &dir), 0);
+
+        fs::create_dir_all(dir.join("alice")).unwrap();
+        write_failures("alice", &dir, 2).unwrap();
+        assert_eq!(read_failures("alice", &dir), 2);
+        let mode = fs::metadata(dir.join("alice/failures")).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        write_failures("alice", &dir, 0).unwrap();
+        assert!(!dir.join("alice/failures").exists());
+        assert_eq!(read_failures("alice", &dir), 0);
+    }
 
     fn tmpdir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

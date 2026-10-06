@@ -18,6 +18,9 @@ VAR_DIR="/var/lib/face-auth"
 SELINUX_DIR="/usr/local/share/face-auth/selinux"
 
 PAM_LINE="auth       sufficient  pam_exec.so quiet /usr/local/bin/face-auth"
+# Runs only after a successful authentication by any method (face, fingerprint,
+# password) and resets the failed-scan lockout counter.
+ACCOUNT_LINE="account    optional    pam_exec.so quiet /usr/local/bin/face-auth"
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "Error: this script installs into /usr/local, /etc and /var/lib — run it with sudo."
@@ -29,7 +32,7 @@ ACTUAL_USER="${SUDO_USER:-${USER:-$(id -un)}}"
 # ---- Undo any previous partial setup ----
 echo "Cleaning up any previous partial setup..."
 
-for service in sudo swaylock gdm-password; do
+for service in sudo swaylock gdm-password gdm-fingerprint; do
     if [ -f "$PAM_DIR/$service" ]; then
         sed -i '/pam_exec\.so.*face-auth/d' "$PAM_DIR/$service" 2>/dev/null || true
     fi
@@ -248,7 +251,21 @@ for service in sudo swaylock gdm-password; do
         echo "         Add this line manually, after the first line:"
         echo "           $PAM_LINE"
     fi
+
+    # swaylock only authenticates; it never runs the account phase.
+    if [ "$service" != "swaylock" ]; then
+        echo "$ACCOUNT_LINE" >> "$conf"
+    fi
 done
+
+# Fingerprint unlock at the GDM login/lock screen uses its own stack. It gets
+# only the counter reset, so a fingerprint unlock lifts a face lockout too.
+conf="$PAM_DIR/gdm-fingerprint"
+if [ -f "$conf" ]; then
+    cp "$conf" "$conf.face-auth.bak"
+    echo "$ACCOUNT_LINE" >> "$conf"
+    echo "Updated $conf (backup at $conf.face-auth.bak)"
+fi
 
 # ---- SELinux policy (for lock screen) ----
 if command -v checkmodule &>/dev/null && command -v semodule_package &>/dev/null; then

@@ -17,6 +17,7 @@ const DETECTOR_THRESHOLD_RANGE: std::ops::RangeInclusive<f32> = 0.05..=1.0;
 const CAPTURE_TIMEOUT_RANGE: std::ops::RangeInclusive<u64> = 100..=30_000;
 const SCAN_DURATION_RANGE: std::ops::RangeInclusive<u64> = 500..=30_000;
 const SCAN_INTERVAL_RANGE: std::ops::RangeInclusive<u64> = 0..=5_000;
+const MAX_FAILURES_LIMIT: u32 = 100;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct FaceAuthConfig {
@@ -29,6 +30,9 @@ pub struct FaceAuthConfig {
     pub detector_threshold: Option<f32>,
     pub scan_duration_ms: Option<u64>,
     pub scan_interval_ms: Option<u64>,
+    /// Consecutive failed scans before face unlock pauses until the next
+    /// successful authentication by any method. 0 disables the limit.
+    pub max_failures: Option<u32>,
 }
 
 impl Default for FaceAuthConfig {
@@ -43,6 +47,7 @@ impl Default for FaceAuthConfig {
             detector_threshold: Some(0.5),
             scan_duration_ms: Some(5000),
             scan_interval_ms: Some(0),
+            max_failures: Some(3),
         }
     }
 }
@@ -161,6 +166,15 @@ impl FaceAuthConfig {
                 self.scan_interval_ms = Some(v);
             }
         }
+        // Fewer attempts is stricter; 0 (no limit) or more attempts is not.
+        if let Some(v) = overlay.max_failures {
+            let floor = self.max_failures();
+            if v >= 1 && (floor == 0 || v < floor) {
+                self.max_failures = Some(v);
+            } else {
+                tracing::warn!(floor, "ignoring user max_failures: would weaken the lockout");
+            }
+        }
 
         // Which IR sensor to use is a preference on a multi-camera machine, so
         // it is honoured — but only after confirming the path really is an IR
@@ -255,6 +269,10 @@ impl FaceAuthConfig {
             .unwrap_or(0)
             .clamp(*SCAN_INTERVAL_RANGE.start(), *SCAN_INTERVAL_RANGE.end())
     }
+
+    pub fn max_failures(&self) -> u32 {
+        self.max_failures.unwrap_or(3).min(MAX_FAILURES_LIMIT)
+    }
 }
 
 /// Read `~/.config/face-auth.toml` for the account being authenticated.
@@ -326,6 +344,36 @@ mod tests {
         };
         cfg.apply_user_overlay(&overlay);
         assert_eq!(cfg.threshold(), 0.8);
+    }
+
+    #[test]
+    fn user_overlay_cannot_weaken_max_failures() {
+        for weaker in [0, 3, 10] {
+            let mut cfg = system_baseline();
+            cfg.apply_user_overlay(&FaceAuthConfig {
+                max_failures: Some(weaker),
+                ..FaceAuthConfig::default()
+            });
+            assert_eq!(cfg.max_failures(), 3, "overlay value {weaker}");
+        }
+    }
+
+    #[test]
+    fn user_overlay_may_tighten_max_failures() {
+        let mut cfg = system_baseline();
+        cfg.apply_user_overlay(&FaceAuthConfig {
+            max_failures: Some(1),
+            ..FaceAuthConfig::default()
+        });
+        assert_eq!(cfg.max_failures(), 1);
+
+        // With the limit disabled system-wide, a user may still opt in.
+        let mut cfg = FaceAuthConfig { max_failures: Some(0), ..system_baseline() };
+        cfg.apply_user_overlay(&FaceAuthConfig {
+            max_failures: Some(5),
+            ..FaceAuthConfig::default()
+        });
+        assert_eq!(cfg.max_failures(), 5);
     }
 
     #[test]
