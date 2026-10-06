@@ -10,7 +10,7 @@ use face_auth_core::{user, FaceAuth, FaceAuthConfig};
 use std::env;
 use std::fs::{DirBuilder, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tracing_subscriber::{fmt, EnvFilter};
@@ -22,10 +22,8 @@ const STATUS_FAIL: &str = "fail";
 /// Face unlock is locked out until the user authenticates another way.
 const STATUS_PAUSED: &str = "paused";
 
-/// Status location for the GDM login screen. The greeter runs as a system
-/// user that cannot read `/run/user/<uid>`, which does not even exist before
-/// the user's first login after boot.
-const GREETER_STATUS_DIR: &str = "/run/face-auth";
+/// Shared status location, created at boot by tmpfiles.d (see deploy.sh).
+const SHARED_STATUS_DIR: &str = "/run/face-auth";
 
 /// Publish scan state to `/run/user/<uid>/face-auth-status` for the lock-screen
 /// indicator extension.
@@ -43,17 +41,17 @@ fn write_status(info: &user::UserInfo, status: &str) {
     if dir.is_dir() {
         write_status_file(&dir.join("face-auth-status"), status);
     }
-    write_greeter_status(status);
+    write_shared_status(info, status);
 }
 
-/// Mirror the status to `/run/face-auth/status` for the login-screen
-/// indicator. Only GDM's stacks have a greeter to inform, so sudo and the
-/// like never touch it.
-fn write_greeter_status(status: &str) {
-    if !env::var("PAM_SERVICE").is_ok_and(|s| s.starts_with("gdm")) {
-        return;
-    }
-    let dir = Path::new(GREETER_STATUS_DIR);
+/// Mirror the status to `/run/face-auth/status` as "<state> <user>", for
+/// every PAM service. This is what the GNOME extension watches: the login
+/// screen runs as a system user that cannot read `/run/user/<uid>` (which does
+/// not exist before the first login after boot), and the sandboxed polkit
+/// helper cannot reach `/run/user` at all. The user name lets a session ignore
+/// scans for other accounts.
+fn write_shared_status(info: &user::UserInfo, status: &str) {
+    let dir = Path::new(SHARED_STATUS_DIR);
     if let Err(e) = DirBuilder::new().mode(0o755).create(dir) {
         if e.kind() != std::io::ErrorKind::AlreadyExists {
             tracing::debug!("could not create {}: {e}", dir.display());
@@ -66,7 +64,7 @@ fn write_greeter_status(status: &str) {
         Ok(m) if m.is_dir() && m.uid() == 0 => {}
         _ => return,
     }
-    write_status_file(&dir.join("status"), status);
+    write_status_file(&dir.join("status"), &format!("{status} {}", info.name));
 }
 
 fn write_status_file(path: &Path, status: &str) {
@@ -77,7 +75,12 @@ fn write_status_file(path: &Path, status: &str) {
         .mode(0o644)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
-        .and_then(|mut f| f.write_all(status.as_bytes()));
+        .and_then(|mut f| {
+            // The mode above is filtered by the umask, and the polkit helper
+            // runs with 0077; the readers are other users, so set it outright.
+            f.set_permissions(std::fs::Permissions::from_mode(0o644))?;
+            f.write_all(status.as_bytes())
+        });
 
     if let Err(e) = result {
         tracing::debug!("could not write scan status to {}: {e}", path.display());

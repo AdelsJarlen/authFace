@@ -32,7 +32,7 @@ ACTUAL_USER="${SUDO_USER:-${USER:-$(id -un)}}"
 # ---- Undo any previous partial setup ----
 echo "Cleaning up any previous partial setup..."
 
-for service in sudo swaylock gdm-password gdm-fingerprint; do
+for service in sudo swaylock gdm-password gdm-fingerprint polkit-1; do
     if [ -f "$PAM_DIR/$service" ]; then
         sed -i '/pam_exec\.so.*face-auth/d' "$PAM_DIR/$service" 2>/dev/null || true
     fi
@@ -226,7 +226,16 @@ fi
 
 # ---- PAM setup ----
 echo "Installing PAM configs..."
-for service in sudo swaylock gdm-password; do
+
+# polkit (GUI admin prompts) ships its stack in /usr/lib/pam.d. A file in
+# /etc/pam.d replaces it entirely, so start from a copy of the vendor file and
+# leave a marker so uninstall.sh deletes it rather than restoring a "backup".
+if [ ! -f "$PAM_DIR/polkit-1" ] && [ -f /usr/lib/pam.d/polkit-1 ]; then
+    cp /usr/lib/pam.d/polkit-1 "$PAM_DIR/polkit-1"
+    touch "$PAM_DIR/polkit-1.face-auth.created"
+fi
+
+for service in sudo swaylock gdm-password polkit-1; do
     conf="$PAM_DIR/$service"
     if [ ! -f "$conf" ]; then
         echo "Warning: $conf not found, skipping"
@@ -265,6 +274,43 @@ if [ -f "$conf" ]; then
     cp "$conf" "$conf.face-auth.bak"
     echo "$ACCOUNT_LINE" >> "$conf"
     echo "Updated $conf (backup at $conf.face-auth.bak)"
+fi
+
+# ---- polkit agent helper sandbox ----
+# polkit's socket-activated helper runs PAM with PrivateDevices=yes and a
+# read-only file system. Open exactly what face-auth needs: the IR camera, its
+# failure counter and the shared status directory.
+if systemctl cat polkit-agent-helper@.service &>/dev/null; then
+    echo "Allowing polkit's agent helper to use the IR camera..."
+    install -d -m 0755 /etc/systemd/system/polkit-agent-helper@.service.d
+    cat > /etc/systemd/system/polkit-agent-helper@.service.d/face-auth.conf <<'UNIT'
+# Installed by authFace deploy.sh: face-auth runs inside this sandbox via
+# pam_exec in /etc/pam.d/polkit-1.
+[Service]
+PrivateDevices=no
+DeviceAllow=char-video4linux rw
+ReadWritePaths=/var/lib/face-auth /run/face-auth
+UNIT
+    systemctl daemon-reload
+fi
+
+# ---- Shared status directory ----
+# Watched by the GNOME extension from the moment the login screen starts, so
+# it has to exist at boot: a watch on a file in a missing directory falls back
+# to polling every few seconds, by which time a face login is already over.
+echo "Creating /run/face-auth at boot (tmpfiles.d)..."
+cat > /etc/tmpfiles.d/face-auth.conf <<'TMPFILES'
+# authFace: scan status for the GNOME lock/login screen indicator.
+d /run/face-auth 0755 root root -
+TMPFILES
+if command -v semanage &>/dev/null; then
+    # One label for every writer (sudo, GDM, polkit) and reader (GDM, session).
+    semanage fcontext -a -t xdm_var_run_t '/run/face-auth(/.*)?' 2>/dev/null \
+        || semanage fcontext -m -t xdm_var_run_t '/run/face-auth(/.*)?'
+fi
+systemd-tmpfiles --create /etc/tmpfiles.d/face-auth.conf
+if command -v restorecon &>/dev/null; then
+    restorecon -R /run/face-auth
 fi
 
 # ---- SELinux policy (for lock screen) ----

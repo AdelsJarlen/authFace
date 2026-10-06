@@ -81,9 +81,14 @@ rm -rf "$GUI_DATA_DIR"
 rm -rf "${XDG_DATA_HOME:-$ACTUAL_HOME/.local/share}/face-auth-gtk"
 
 echo "Restoring PAM configs..."
-for service in sudo swaylock gdm-password gdm-fingerprint; do
+for service in sudo swaylock gdm-password gdm-fingerprint polkit-1; do
     conf="$PAM_DIR/$service"
-    if [ -f "$conf.face-auth.bak" ]; then
+    if [ -f "$conf.face-auth.created" ]; then
+        # deploy.sh copied this from /usr/lib/pam.d; removing it restores the
+        # vendor stack.
+        rm -f "$conf" "$conf.face-auth.bak" "$conf.face-auth.created"
+        echo "Removed $conf (vendor stack in /usr/lib/pam.d applies again)"
+    elif [ -f "$conf.face-auth.bak" ]; then
         mv "$conf.face-auth.bak" "$conf"
         echo "Restored $conf from backup"
     else
@@ -104,6 +109,15 @@ if [ -f /etc/dconf/db/gdm.d/90-authface-scan-indicator ]; then
     dconf update 2>/dev/null || true
 fi
 rm -rf /run/face-auth
+rm -f /etc/tmpfiles.d/face-auth.conf
+semanage fcontext -d '/run/face-auth(/.*)?' 2>/dev/null || true
+
+echo "Removing polkit agent helper override..."
+if [ -f /etc/systemd/system/polkit-agent-helper@.service.d/face-auth.conf ]; then
+    rm -f /etc/systemd/system/polkit-agent-helper@.service.d/face-auth.conf
+    rmdir /etc/systemd/system/polkit-agent-helper@.service.d 2>/dev/null || true
+    systemctl daemon-reload
+fi
 
 echo ""
 if [ "$PURGE" = true ]; then
