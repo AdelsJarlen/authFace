@@ -1,5 +1,5 @@
 use crate::capture::IrFrame;
-use image::{DynamicImage, ImageBuffer, Luma};
+use image::{ImageBuffer, Luma};
 use tract_onnx::prelude::tract_ndarray::Array3;
 
 const ENCODER_SIZE: usize = 112;
@@ -30,29 +30,92 @@ pub fn frame_to_luma16(frame: &IrFrame) -> anyhow::Result<ImageBuffer<Luma<u16>,
     }))
 }
 
-/// Resize and normalise a frame into the encoder's `[3, 112, 112]` input.
+/// Where the standard ArcFace 112×112 crop puts the left eye, right eye, nose
+/// tip and left and right mouth corners. The encoder was trained on faces
+/// warped onto exactly these points.
+pub const ARCFACE_LANDMARKS: [[f32; 2]; 5] = [
+    [38.2946, 51.6963],
+    [73.5318, 51.5014],
+    [56.0252, 71.7366],
+    [41.5493, 92.3655],
+    [70.7299, 92.2041],
+];
+
+/// Least-squares similarity transform (rotation, uniform scale, translation)
+/// taking `src` onto `dst`, as `(a, b, tx, ty)` for
+///
+/// ```text
+/// x' = a·x − b·y + tx
+/// y' = b·x + a·y + ty
+/// ```
+///
+/// This is the closed form of Umeyama's method in two dimensions, which is
+/// what InsightFace uses to align faces for these models.
+pub fn estimate_similarity(src: &[[f32; 2]; 5], dst: &[[f32; 2]; 5]) -> (f32, f32, f32, f32) {
+    let n = src.len() as f64;
+    let mean = |pts: &[[f32; 2]; 5]| {
+        let (sx, sy) = pts
+            .iter()
+            .fold((0.0f64, 0.0f64), |(x, y), p| (x + p[0] as f64, y + p[1] as f64));
+        (sx / n, sy / n)
+    };
+    let (msx, msy) = mean(src);
+    let (mdx, mdy) = mean(dst);
+
+    let (mut num_a, mut num_b, mut den) = (0.0f64, 0.0f64, 0.0f64);
+    for (s, d) in src.iter().zip(dst) {
+        let (sx, sy) = (s[0] as f64 - msx, s[1] as f64 - msy);
+        let (dx, dy) = (d[0] as f64 - mdx, d[1] as f64 - mdy);
+        num_a += sx * dx + sy * dy;
+        num_b += sx * dy - sy * dx;
+        den += sx * sx + sy * sy;
+    }
+    let (a, b) = if den > 0.0 { (num_a / den, num_b / den) } else { (0.0, 0.0) };
+    let tx = mdx - (a * msx - b * msy);
+    let ty = mdy - (b * msx + a * msy);
+    (a as f32, b as f32, tx as f32, ty as f32)
+}
+
+/// Warp the face at `landmarks` (frame coordinates, in [`ARCFACE_LANDMARKS`]
+/// order) into the encoder's aligned, normalised `[3, 112, 112]` input.
 ///
 /// The arithmetic here defines what an enrolled embedding means; changing it
-/// invalidates every template already on disk.
-pub fn preprocess_ir_frame(frame: &IrFrame) -> anyhow::Result<Array3<f32>> {
-    let img_buffer = frame_to_luma16(frame)?;
+/// invalidates every template already on disk (see `EMBEDDING_VERSION`).
+pub fn align_face(frame: &IrFrame, landmarks: &[[f32; 2]; 5]) -> anyhow::Result<Array3<f32>> {
+    let img = frame_to_luma16(frame)?;
+    let (width, height) = img.dimensions();
 
-    let dynamic_img = DynamicImage::ImageLuma16(img_buffer);
-    let resized = dynamic_img.resize_exact(
-        ENCODER_SIZE as u32,
-        ENCODER_SIZE as u32,
-        image::imageops::FilterType::Lanczos3,
-    );
-    let gray_img = resized.to_luma16();
+    let (a, b, tx, ty) = estimate_similarity(landmarks, &ARCFACE_LANDMARKS);
+    let det = a * a + b * b;
+    anyhow::ensure!(det.is_finite() && det > 1e-12, "degenerate face landmarks");
+
+    let sample = |x: i64, y: i64| -> f32 {
+        if x < 0 || y < 0 || x >= width as i64 || y >= height as i64 {
+            0.0 // outside the frame: black, as warpAffine pads
+        } else {
+            img.get_pixel(x as u32, y as u32).0[0] as f32
+        }
+    };
 
     let mut array = Array3::<f32>::zeros((3, ENCODER_SIZE, ENCODER_SIZE));
+    for v in 0..ENCODER_SIZE {
+        for u in 0..ENCODER_SIZE {
+            // Inverse map from crop pixel to frame position, then bilinear.
+            let du = u as f32 - tx;
+            let dv = v as f32 - ty;
+            let x = (a * du + b * dv) / det;
+            let y = (-b * du + a * dv) / det;
 
-    for y in 0..ENCODER_SIZE {
-        for x in 0..ENCODER_SIZE {
-            let pixel = gray_img.get_pixel(x as u32, y as u32).0[0] as f32 / 65535.0;
+            let (x0, y0) = (x.floor(), y.floor());
+            let (fx, fy) = (x - x0, y - y0);
+            let (x0, y0) = (x0 as i64, y0 as i64);
+            let top = sample(x0, y0) * (1.0 - fx) + sample(x0 + 1, y0) * fx;
+            let bottom = sample(x0, y0 + 1) * (1.0 - fx) + sample(x0 + 1, y0 + 1) * fx;
+            let pixel = (top * (1.0 - fy) + bottom * fy) / 65535.0;
+
             let normalized = (pixel - 0.5) / 0.5;
             for c in 0..3usize {
-                array[[c, y, x]] = normalized;
+                array[[c, v, u]] = normalized;
             }
         }
     }
@@ -188,7 +251,7 @@ mod tests {
         // encoder would happily turn into an embedding.
         let f = frame(vec![0; 10], 32, 32);
         assert!(frame_to_luma16(&f).is_err());
-        assert!(preprocess_ir_frame(&f).is_err());
+        assert!(align_face(&f, &ARCFACE_LANDMARKS).is_err());
     }
 
     #[test]
@@ -211,11 +274,56 @@ mod tests {
     }
 
     #[test]
-    fn preprocess_produces_encoder_shaped_input() {
-        let f = frame((0..64 * 64).map(|i| (i % 65536) as u16).collect(), 64, 64);
-        let arr = preprocess_ir_frame(&f).unwrap();
+    fn similarity_recovers_a_known_transform() {
+        // Rotate 30°, scale 2, translate (5, -3).
+        let (sin, cos) = 30f32.to_radians().sin_cos();
+        let (a, b, tx, ty) = (2.0 * cos, 2.0 * sin, 5.0, -3.0);
+        let src = ARCFACE_LANDMARKS;
+        let dst = src.map(|[x, y]| [a * x - b * y + tx, b * x + a * y + ty]);
+        let (ea, eb, etx, ety) = estimate_similarity(&src, &dst);
+        for (got, want) in [(ea, a), (eb, b), (etx, tx), (ety, ty)] {
+            assert!((got - want).abs() < 1e-3, "got {got}, want {want}");
+        }
+    }
+
+    #[test]
+    fn aligned_face_at_reference_position_is_the_frame_itself() {
+        // A 112×112 frame whose landmarks already sit on the ArcFace points
+        // aligns to an identity warp: the crop is the frame, normalised.
+        let f = frame((0..112 * 112).map(|i| ((i % 251) as u16) * 257).collect(), 112, 112);
+        let arr = align_face(&f, &ARCFACE_LANDMARKS).unwrap();
         assert_eq!(arr.shape(), &[3, ENCODER_SIZE, ENCODER_SIZE]);
-        assert!(arr.iter().all(|v| v.is_finite() && (-1.0..=1.0).contains(v)));
+        for (y, x) in [(0, 0), (40, 70), (111, 111)] {
+            let want = (f.data[y * 112 + x] as f32 / 65535.0 - 0.5) / 0.5;
+            assert!((arr[[0, y, x]] - want).abs() < 1e-4, "pixel ({x}, {y})");
+            assert_eq!(arr[[0, y, x]], arr[[2, y, x]]);
+        }
+    }
+
+    #[test]
+    fn aligned_face_follows_the_landmarks() {
+        // The face is twice the reference size and offset by (100, 50): a
+        // bright patch around the frame-space nose tip must land on the
+        // crop's nose tip.
+        let (w, h) = (400u32, 300u32);
+        let landmarks = ARCFACE_LANDMARKS.map(|[x, y]| [2.0 * x + 100.0, 2.0 * y + 50.0]);
+        let [nx, ny] = landmarks[2];
+        let data = (0..w * h)
+            .map(|i| {
+                let (x, y) = ((i % w) as f32, (i / w) as f32);
+                if (x - nx).abs() < 6.0 && (y - ny).abs() < 6.0 { 65535 } else { 0 }
+            })
+            .collect();
+        let arr = align_face(&frame(data, w, h), &landmarks).unwrap();
+        let [cx, cy] = ARCFACE_LANDMARKS[2];
+        assert!(arr[[0, cy as usize, cx as usize]] > 0.9, "nose tip should be bright");
+        assert!(arr[[0, 10, 10]] < -0.9, "corner should be dark");
+    }
+
+    #[test]
+    fn degenerate_landmarks_are_rejected() {
+        let f = frame(vec![0; 64 * 64], 64, 64);
+        assert!(align_face(&f, &[[10.0, 10.0]; 5]).is_err());
     }
 
     #[test]

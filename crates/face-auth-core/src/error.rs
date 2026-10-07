@@ -23,7 +23,7 @@ pub enum FaceAuthError {
     #[error("No embeddings found for user")]
     NoEmbeddings,
 
-    #[error("Invalid embedding format")]
+    #[error("Invalid or outdated face template — re-enrol with face-enroll")]
     InvalidEmbeddingFormat,
 
     #[error("No face detected in frame")]

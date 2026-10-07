@@ -245,7 +245,7 @@ impl FaceAuthConfig {
     pub fn detector_model_path(&self) -> String {
         self.detector_model_path
             .clone()
-            .unwrap_or_else(|| "/usr/local/share/face-auth/version-slim-320.onnx".to_string())
+            .unwrap_or_else(|| "/usr/local/share/face-auth/det_500m.onnx".to_string())
     }
 
     pub fn detector_threshold(&self) -> f32 {

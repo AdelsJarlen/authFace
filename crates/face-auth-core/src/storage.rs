@@ -6,7 +6,9 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-const EMBEDDING_VERSION: u32 = 1;
+/// 2: embeddings of SCRFD-aligned face crops. Version 1 encoded the whole
+/// frame squashed to 112×112; those templates cannot match a crop.
+const EMBEDDING_VERSION: u32 = 2;
 const EMBEDDING_DIM: u32 = 512;
 
 /// Upper bound on stored embeddings per user.

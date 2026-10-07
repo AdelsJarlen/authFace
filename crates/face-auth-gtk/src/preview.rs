@@ -185,7 +185,7 @@ fn capture_loop(
         if last_detect.elapsed() >= DETECT_INTERVAL {
             // Detection alone answers "is there a face". The old code also ran
             // the full 512-d encoder here and threw the embedding away.
-            face_detected = detector.detect(&frame).unwrap_or(false);
+            face_detected = detector.detect(&frame).map(|d| d.is_some()).unwrap_or(false);
             last_detect = Instant::now();
         }
 

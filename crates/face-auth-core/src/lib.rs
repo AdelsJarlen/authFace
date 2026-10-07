@@ -74,11 +74,11 @@ impl FaceAuth {
         let mut frame = frame;
         crate::preprocess::histogram_equalize(&mut frame);
 
-        if !self.detector.detect(&frame)? {
+        let Some(face) = self.detector.detect(&frame)? else {
             return Err(FaceAuthError::NoFaceDetected.into());
-        }
+        };
 
-        let input = crate::preprocess::preprocess_ir_frame(&frame)?;
+        let input = crate::preprocess::align_face(&frame, &face.landmarks)?;
         let embedding = self.encoder.encode(input.view())?;
         tracing::debug!(elapsed = ?t0.elapsed(), "authenticate_once complete");
 
@@ -155,12 +155,12 @@ impl FaceAuth {
             let mut frame = frame;
             crate::preprocess::histogram_equalize(&mut frame);
 
-            if !self.detector.detect(&frame)? {
+            let Some(face) = self.detector.detect(&frame)? else {
                 nap(deadline);
                 continue;
-            }
+            };
 
-            let input = crate::preprocess::preprocess_ir_frame(&frame)?;
+            let input = crate::preprocess::align_face(&frame, &face.landmarks)?;
             let embedding = self.encoder.encode(input.view())?;
 
             if verify_embedding(&embedding, &store, self.config.threshold())? {
@@ -220,13 +220,13 @@ impl FaceAuth {
             let mut frame = frame;
             crate::preprocess::histogram_equalize(&mut frame);
 
-            if !self.detector.detect(&frame)? {
+            let Some(face) = self.detector.detect(&frame)? else {
                 progress(EnrollProgress::NoFace);
                 std::thread::sleep(Duration::from_millis(interval_ms));
                 continue;
-            }
+            };
 
-            let input = crate::preprocess::preprocess_ir_frame(&frame)?;
+            let input = crate::preprocess::align_face(&frame, &face.landmarks)?;
             let embedding = self.encoder.encode(input.view())?;
             store.add_embedding(embedding);
             captured += 1;
