@@ -11,12 +11,41 @@ By [Peter Falkingham](https://peterfalkingham.com)
 > [!NOTE]
 > Includes improvements contributed via [SamVivan1/authFace](https://github.com/SamVivan1/authFace) — robust IR camera detection, distro-aware PAM configuration, and the GNOME Shell lock-screen scan indicator. See [Upstream Merges & Security Pass](#upstream-merges--security-pass).
 
-- **Face unlock for sudo, lock screen (GNOME/Sway), and `gdm-password`**
+> [!IMPORTANT]
+> **This is the `local-patches` branch of [AdelsJarlen/authFace](https://github.com/AdelsJarlen/authFace)**,
+> a fork that adds landmark-aligned recognition (better range), a failed-scan
+> lockout, face unlock in GUI admin prompts, and a Face ID–style animation on
+> the lock screen, the GDM login screen, `sudo` and admin prompts. See
+> [This fork's changes](#this-forks-changes). Upgrading from upstream needs a
+> **re-enrolment**.
+
+- **Face unlock for sudo, lock screen (GNOME/Sway), `gdm-password` and polkit admin prompts**
 - **~2 seconds** from camera poll to authenticated
 - **Static musl binary** — no dependencies, no runtime
-- **No daemon, no systemd units, no D-Bus**
+- **No daemon, no D-Bus** — only a `tmpfiles.d` entry and, for admin prompts, a polkit-helper drop-in
 - **GUI settings panel** (optional GTK4 app) for camera selection and enrollment
-- **Immutable-first** — everything fits in `/usr/local` and `~/.local`, no `/usr` modifications needed
+- **Immutable-first core** — binaries and models fit in `/usr/local`; the login-screen animation is the one part that needs `/usr/share`
+
+## This fork's changes
+
+Seven commits on top of upstream `96a2fda`, developed and tested on a ThinkPad
+T490 (Chicony `04f2:b681` IR camera), Fedora 44, GNOME 50 on Wayland.
+
+| Change | Upstream | This fork |
+|--------|----------|-----------|
+| **Face alignment** | The whole 640×360 frame is squashed to 112×112 for the recognizer; the detector is only a yes/no gate. Recognition fades past ~30 cm because the face is a few pixels of the input. | SCRFD-500M (`det_500m.onnx`, from the same InsightFace `buffalo_sc` pack) finds the face and five landmarks. The face is warped onto ArcFace's standard landmark positions and only that 112×112 crop is encoded, as the model was trained. Templates move to version 2, so **re-enrol**. |
+| **tract Resize workaround** | — | tract 0.21 mis-evaluates SCRFD's two run-time-sized Resize nodes (garbage scores when optimised). The loader rewrites them to constant 2× scales; output verified identical to onnxruntime. |
+| **Failed-scan lockout** | Unlimited scans at every prompt | After `max_failures` (default 3) failed scans in a row, face unlock pauses and the prompt goes straight to fingerprint or password. Any successful login resets it, through a PAM `account` line. |
+| **Corrupt first frame** | Enrolment aborts with `short frame`; the GUI preview loops on it | Enrolment and preview tolerate 3 consecutive capture errors, like authentication already did |
+| **Scan animation** | Text pill, lock screen only; doesn't load on GNOME 50 | Face ID–style animation (scan beam, check mark, head-shake, amber "paused" state) on the lock screen, GDM login screen, `sudo` and polkit dialogs. GNOME 50 supported. |
+| **Status file** | `/run/user/<uid>/face-auth-status`, unreadable before first login | One shared `/run/face-auth/status` (`<state> <user>`), created at boot by `tmpfiles.d` |
+| **Admin prompts** | Password only | `deploy.sh` adds face-auth to polkit's PAM stack and opens the helper's sandbox to the IR camera |
+
+Upgrade: rebuild, `sudo ./deploy.sh` (downloads the new detector), then
+`sudo face-enroll --user $USER`. Until you re-enrol, old templates are refused
+and the prompt falls back to fingerprint or password. For the login-screen
+animation, also run `sudo extensions/authface-scan-indicator/install-greeter.sh`
+and log out.
 
 ## Upstream Merges & Security Pass
 
@@ -213,10 +242,11 @@ sudo ./deploy.sh
 |------|------|---------|
 | Build | Compiles if `cargo` is available | Falls back to pre-built binaries in `target/` |
 | Binaries | Installs to `/usr/local/bin` | `face-auth` + `face-enroll` |
-| Detection model | Downloads `version-slim-320.onnx` if missing | From Ultra-Light-Fast-Generic-Face-Detector-1MB upstream |
-| Recog. model | Downloads from InsightFace | `w600k_mbf.onnx` (~13 MB) to `/usr/local/share/face-auth/` |
+| Models | Downloads InsightFace `buffalo_sc` once | `det_500m.onnx` (detector) and `w600k_mbf.onnx` (~13 MB, recognizer) to `/usr/local/share/face-auth/`, each SHA-256 verified |
 | Config | Installs default config | `/etc/face-auth.toml` |
-| PAM | Patches PAM service files | Adds `sufficient` `pam_exec.so quiet` to `sudo`, `gdm-password`, `swaylock` |
+| PAM | Patches PAM service files | Adds `sufficient` `pam_exec.so quiet` to `sudo`, `gdm-password`, `swaylock`, `polkit-1`, plus an `account optional` line that resets the lockout counter |
+| polkit | Copies `/usr/lib/pam.d/polkit-1` to `/etc/pam.d` | Plus a `polkit-agent-helper@.service` drop-in that lets the helper open the IR camera |
+| Status dir | `/etc/tmpfiles.d/face-auth.conf` | Creates `/run/face-auth` at boot, labelled `xdm_var_run_t` |
 | SELinux | Compiles and loads policy | Allows `xdm_t` to mmap camera for lock-screen auth |
 | Storage | Creates embeddings directory | `/var/lib/face-auth/<user>/` with sticky bit |
 
@@ -293,6 +323,7 @@ threshold = 0.6
 model_path = "/usr/local/share/face-auth/w600k_mbf.onnx"
 embeddings_dir = "/var/lib/face-auth"
 capture_timeout_ms = 5000
+max_failures = 3         # failed scans before face unlock pauses; 0 = no limit
 ```
 
 Environment variable names follow the field names, so the capture timeout is
@@ -303,7 +334,9 @@ Environment variable names follow the field names, so the capture timeout is
 > reference ASUS FHD webcam, `/dev/video2` captures and `/dev/video3` does not.
 > Auto-detection opens each IR-named candidate and takes the first that is
 > really a GREY capture device, which gets this right; a hand-written path
-> often does not.
+> often does not. Exception: on a ThinkPad T490 (Chicony `04f2:b681`) it
+> picked the metadata node and failed with `ioctl failed: Invalid argument`;
+> pin `device` if you see that.
 
 The GUI writes camera and threshold changes to `~/.config/face-auth.toml`.
 
@@ -343,38 +376,47 @@ The deploy script adds a `sufficient` `pam_exec.so quiet` line to:
 | `sudo` | `/etc/pam.d/sudo` | After `#%PAM-1.0` |
 | `gdm-password` | `/etc/pam.d/gdm-password` | After `pam_selinux_permit.so` (Fedora) / after `#%PAM-1.0` (Ubuntu/Debian) |
 | `swaylock` | `/etc/pam.d/swaylock` | After `#%PAM-1.0` |
+| `polkit-1` | `/etc/pam.d/polkit-1` (copied from `/usr/lib/pam.d`) | After `#%PAM-1.0` |
 
 `sufficient` means: if face-auth exits 0, the user is authenticated immediately.
 If it fails (no match, no camera, timeout), PAM falls through to password prompt.
+
+Every service except `swaylock` also gets
+`account optional pam_exec.so quiet /usr/local/bin/face-auth` at the end, and
+`gdm-fingerprint` gets only that line. The account phase runs only after the
+user has authenticated by some method, so face-auth uses it to reset the
+failed-scan counter: a fingerprint or password login lifts a lockout.
 
 `quiet` suppresses PAM chatter on the lock screen so the unlock UI stays clean.
 
 No `timeout`, `setenv`, or `env_pass` flags are needed — face-auth reads the camera
 (not stdin) and resolves `PAM_USER` via its own fallback chain.
 
-## Lock Screen Scan Indicator (GNOME Shell extension)
+## Scan Animation (GNOME Shell extension)
 
 By default the scan is silent: `face-auth` runs headless inside PAM, so the only
-feedback is the camera LED. A companion GNOME Shell extension shows live status
-**on the lock screen** while the face is being scanned:
+feedback is the camera LED. A companion GNOME Shell extension draws a Face
+ID–style animation while the face is being scanned, on the **lock screen**, the
+**GDM login screen**, and in your session for **`sudo`** and **admin prompts**:
 
-| Status | Indicator |
+| Status | Animation |
 |--------|-----------|
-| Scanning | Pulsing pill with camera icon + "Scanning face…" |
-| Success | Green check — "Face recognised" (briefly) |
-| Failure | Red error — "Face not recognised — use your password" |
+| Scanning | Face glyph in rounded corner brackets with a sweeping cyan scan line |
+| Success | A green check mark draws in (finishes over the fading lock screen) |
+| Failure | Red head-shake with a frown — "use your password" |
+| Paused | Amber pause badge — "Face unlock paused — use fingerprint or password" |
 
 ### How it works
 
-1. `face-auth` (the PAM binary) writes a status file to the authenticated user's
-   runtime directory while it runs: `/run/user/<uid>/face-auth-status` containing
-   `scanning`, then `ok` or `fail`.
-2. The extension watches that file with a `Gio.FileMonitor` while the unlock
-   UI is on screen, and renders the indicator above it.
-
-   The file is written with `O_NOFOLLOW` because `face-auth` runs as root and
-   the runtime directory belongs to the user — otherwise a symlink there would
-   aim a root write at any file on the system.
+1. `face-auth` writes `<state> <user>` to `/run/face-auth/status` for every
+   PAM service: `scanning`, then `ok`, `fail` or `paused`. The directory is
+   created at boot by `tmpfiles.d`, so it exists before the login screen
+   starts; the file is root-owned, written with `O_NOFOLLOW`, and readable by
+   the `gdm` user and your session.
+2. The extension watches the file with a `Gio.FileMonitor` in every session
+   mode (`user`, `unlock-dialog`, `gdm`). A user session ignores scans for
+   other accounts, results older than 15 s are ignored, and the card is raised
+   above modal dialogs such as the polkit prompt.
 
 No daemon, no D-Bus server — just a small status file, keeping the zero-footprint
 design of the core.
@@ -382,46 +424,61 @@ design of the core.
 ### Install
 
 ```bash
-# Requires GNOME Shell 45+ (Fedora 39+, Bazzite, Bluefin, Silverblue, Kinoite)
+# System-wide, including the GDM login screen (recommended)
+sudo extensions/authface-scan-indicator/install-greeter.sh
+# Then log out and back in (Wayland loads extensions only at login)
+
+# Or per-user only (lock screen, sudo, admin prompts — not the login screen)
 extensions/authface-scan-indicator/install-extension.sh
-# Then: Alt+F2 → r (X11) or log out/in (Wayland)
 ```
 
-Everything lives in `~/.local/share/gnome-shell/extensions/` — immutable-friendly.
-
-> **Note:** this shows on the **session lock screen** (Super+L / auto-lock), not
-> on the GDM login/greeter screen. The greeter runs in a separate locked-down
-> shell as the `gdm` user and does not expose hooks for third-party indicators.
+The login screen runs GNOME Shell as the `gdm` user, which cannot read your
+home directory, so `install-greeter.sh` installs to
+`/usr/share/gnome-shell/extensions/` and enables the extension in GDM's dconf
+database. It removes a per-user copy, which would otherwise shadow it.
+Remove with `sudo extensions/authface-scan-indicator/install-greeter.sh --remove`.
+Requires GNOME Shell 45–50.
 
 ## How It Works
 
 ```
-PAM (sudo / gdm-password / swaylock)
+PAM (sudo / gdm-password / swaylock / polkit-1)
   │
   ▼
 face-auth (static binary)
   ├─ Resolve PAM_USER via getent (refuses to guess from USER/LOGNAME)
   ├─ Refuse if PAM_RHOST names a remote host
   ├─ Load /etc/face-auth.toml + strictly-narrowing user overlay
-  ├─ V4L2 capture from IR camera (640×400 GREY, auto-detected /dev/videoN)
+  ├─ Paused after max_failures failed scans? → exit 1 without opening the camera
+  ├─ V4L2 capture from IR camera (GREY, auto-detected or pinned /dev/videoN)
   │   └─ poll() with 5s timeout — exits cleanly if camera hangs
   ├─ Histogram equalization
-  ├─ Face detection (RetinaFace-derived ONNX model)
-  ├─ Resize to 112×112, normalize to [-1, 1]
+  ├─ Face detection: SCRFD-500M → box + 5 landmarks
+  ├─ Similarity warp onto ArcFace landmark positions → 112×112 crop, [-1, 1]
   ├─ tract-onnx inference (MobileFaceNet, 512-d embedding)
   ├─ Cosine similarity vs stored embeddings (default threshold 0.6)
-  └─ Exit 0 (match) or exit 1 (no match → password prompt)
+  ├─ Write /run/face-auth/status; count or reset failures
+  └─ Exit 0 (match) or exit 1 (no match → fingerprint / password)
+
+PAM account phase (after any successful login) → face-auth resets the failure count
 ```
 
 ## Model
 
-Uses InsightFace **`w600k_mbf.onnx`** (MobileFaceNet @ WebFace600K, ~13 MB, 512-d output)
-from the `buffalo_sc` model pack, plus **`version-slim-320.onnx`** for face detection.
-Licensed under MIT (InsightFace is MIT-licensed).
+Uses two models from InsightFace's **`buffalo_sc`** pack:
 
-The recognition model is **not bundled** in this repository. `deploy.sh` downloads it from
-InsightFace's official GitHub releases and verifies the SHA-256 checksum. The detection
-model is auto-downloaded from the Ultra-Light-Fast-Generic-Face-Detector-1MB repository.
+- **`det_500m.onnx`** — SCRFD-500M face detector (box + five landmarks), run at
+  640×384 so a 640×360 IR frame is not downscaled.
+- **`w600k_mbf.onnx`** — MobileFaceNet @ WebFace600K, ~13 MB, 512-d embedding,
+  fed the landmark-aligned 112×112 crop it was trained on.
+
+Neither model is **bundled** in this repository. `deploy.sh` downloads the pack
+once from InsightFace's official GitHub releases and verifies each file's
+SHA-256 checksum.
+
+> **Licence:** InsightFace's *code* is MIT, but its **pretrained models are
+> released for non-commercial research use only**. Check whether that fits
+> your use, for example on a work machine.
 
 ## SELinux
 
@@ -501,6 +558,45 @@ A dark frame is worse than useless: histogram equalisation stretches its narrow
 range across the full scale and turns sensor noise into a high-contrast grey
 field, which is what a flickering preview is showing you.
 
+**Every frame dark: turn the emitter on.** On many laptops (ThinkPads, Dells)
+the IR illuminator stays off under Linux until something sends the vendor's
+UVC command. [linux-enable-ir-emitter](https://github.com/EmixamPP/linux-enable-ir-emitter)
+finds and replays it. In 6.x, options go **before** the subcommand
+(`sudo linux-enable-ir-emitter --device /dev/video2 configure`), then
+`sudo systemctl enable --now linux-enable-ir-emitter`. Answer its prompts by
+looking at the camera through a phone camera: the emitter shows as a purple
+flash, while the small white LED is only the camera-on light. Its author warns
+that `configure` may damage camera firmware, so read the project's notes first.
+
+### "short frame: got N bytes, expected M"
+
+Some UVC IR cameras send one truncated, error-flagged frame right after the
+stream starts. This fork tolerates up to three in a row during enrolment and in
+the GUI preview; if you still see it, you are running upstream binaries.
+
+### "Invalid or outdated face template — re-enrol with face-enroll"
+
+Your templates predate landmark-aligned recognition. Run
+`sudo face-enroll --user $USER`. To see what the recognizer sees (box,
+landmarks and the aligned crop as PNGs):
+
+```bash
+cargo run --release -p face-auth-core --example align-probe -- \
+  /dev/video2 /usr/local/share/face-auth/det_500m.onnx . 3
+```
+
+### No animation on the login screen, but only after a reboot
+
+`/run/face-auth` must exist when GDM starts, or the extension's file watch
+falls back to slow polling and misses the scan. Check that
+`/etc/tmpfiles.d/face-auth.conf` exists and `ls -ldZ /run/face-auth` shows
+`xdm_var_run_t`; re-run `sudo ./deploy.sh` if not.
+
+### Face unlock is paused
+
+After `max_failures` failed scans, face unlock waits for a fingerprint or
+password login. To clear it by hand: `sudo rm /var/lib/face-auth/$USER/failures`.
+
 ### Which camera will it use?
 
 ```bash
@@ -549,8 +645,14 @@ A user config may only make matching *stricter*. To loosen it, lower
   A high-quality IR-visible print or a 3D mask may bypass verification. This is
   the main residual risk and it is inherent to the approach — treat face unlock
   as a convenience over a password you still have, not as a stronger factor.
-- **No rate limiting or lockout.** Every prompt allows a fresh scan window.
-  PAM's own `pam_faildelay`/`pam_tally2` are not wired up.
+- **Lockout is per face, not per password.** After `max_failures` failed scans
+  (default 3) face unlock pauses until a successful login by any method.
+  The counter lives in `/var/lib/face-auth/<user>/failures`, root-only, and
+  survives reboots. A user's own config may only lower the limit.
+- **polkit helper sandbox is loosened.** For face unlock in admin prompts,
+  a drop-in sets `PrivateDevices=no` on `polkit-agent-helper@.service`
+  and allows only video4linux devices plus write access to
+  `/var/lib/face-auth` and `/run/face-auth`.
 - **`sufficient` bypasses the rest of the auth stack.** A successful match
   satisfies authentication outright; any other `auth` module below the
   face-auth line is skipped. That is the point, but it means the strength of
@@ -572,12 +674,13 @@ authFace/
       src/
         capture.rs           # V4L2 capture + poll() timeout + IR camera auto-detect
         config.rs            # Layered config + narrowing overlay for PAM + per-user load
-        detector.rs          # Face detection (RetinaFace-based ONNX model)
+        detector.rs          # SCRFD face detection: box + 5 landmarks
         error.rs             # Error types
         inference.rs         # tract-onnx model loading + encoding
         lib.rs               # FaceAuth struct, auth + enroll + scan
-        preprocess.rs        # Histogram equalize, resize, normalize
-        storage.rs           # Binary embedding I/O (versioned, atomic, 0600)
+        preprocess.rs        # Histogram equalize, landmark alignment, normalize
+        storage.rs           # Binary embedding I/O (versioned, atomic, 0600) + failure counter
+      examples/              # align-probe, bench, detect-camera, frame-stats
         user.rs              # NSS lookup + username validation
         verify.rs            # Cosine similarity
     face-auth/               # PAM binary (stdin-less, PAM_USER fallback)
@@ -590,10 +693,11 @@ authFace/
   selinux/
     face-auth.te             # SELinux policy source
   extensions/
-    authface-scan-indicator/ # GNOME Shell lock-screen scan indicator
+    authface-scan-indicator/ # GNOME Shell scan animation
       extension.js
       metadata.json
-      install-extension.sh
+      install-extension.sh   # per-user install
+      install-greeter.sh     # system-wide install incl. GDM login screen
   deploy.sh                  # Core auth installer
   deploy-gui.sh              # Optional GUI installer
   uninstall.sh               # Removal script (--gui, --purge flags)
@@ -603,6 +707,7 @@ authFace/
 
 MIT
 
-This is a fork of [pfalkingham/authFace](https://github.com/pfalkingham/authFace) (MIT). The
-facial recognition model is InsightFace's `w600k_mbf.onnx` (MIT) and the face detector is
-`version-slim-320.onnx` (MIT).
+This is a fork of [pfalkingham/authFace](https://github.com/pfalkingham/authFace) (MIT).
+The models are not part of this repository: InsightFace's `w600k_mbf.onnx` and
+`det_500m.onnx` are downloaded at install time and are licensed by InsightFace
+for non-commercial research use only (see [Model](#model)).
