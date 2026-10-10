@@ -597,6 +597,12 @@ falls back to slow polling and misses the scan. Check that
 After `max_failures` failed scans, face unlock waits for a fingerprint or
 password login. To clear it by hand: `sudo rm /var/lib/face-auth/$USER/failures`.
 
+If it stays paused after a successful login at the login or lock screen, check
+the store's SELinux label. GDM runs face-auth as `xdm_t`, which may only read
+the generic `var_lib_t`, so its reset is denied (`avc: denied { unlink } ...
+name="failures"`). `ls -dZ /var/lib/face-auth` should show
+`face_auth_var_lib_t`; re-run `sudo ./deploy.sh` if it doesn't.
+
 ### Which camera will it use?
 
 ```bash
