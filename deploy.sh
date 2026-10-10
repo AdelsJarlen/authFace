@@ -358,6 +358,16 @@ if [ -n "$(find "$VAR_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ];
     echo "  sudo rm -rf $VAR_DIR && sudo ./deploy.sh"
 fi
 
+# Label the store with the module's own type: under the generic var_lib_t the
+# login and lock screen (xdm_t) can only read it, so they could never record a
+# failed scan or reset the counter after a successful login.
+if command -v semanage &>/dev/null && semodule -l 2>/dev/null | grep -x face_auth >/dev/null; then
+    echo "Labelling $VAR_DIR for the login and lock screen..."
+    semanage fcontext -a -t face_auth_var_lib_t "$VAR_DIR(/.*)?" 2>/dev/null \
+        || semanage fcontext -m -t face_auth_var_lib_t "$VAR_DIR(/.*)?"
+    restorecon -R "$VAR_DIR"
+fi
+
 echo ""
 echo "=== Install complete! ==="
 echo ""

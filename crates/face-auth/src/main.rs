@@ -217,8 +217,10 @@ fn main() {
     // so it is where a failed-scan lockout ends.
     if env::var("PAM_TYPE").as_deref() == Ok("account") {
         if let Ok(config) = FaceAuthConfig::load_for_auth(&info.name) {
+            // An error here leaves face unlock paused for good, and pam_exec
+            // runs quietly, so make it visible in the journal.
             if let Err(e) = write_failures(&info.name, &config.embeddings_dir(), 0) {
-                tracing::warn!("could not reset failed-scan counter: {e}");
+                tracing::error!("could not reset failed-scan counter for '{}': {e}", info.name);
             }
         }
         std::process::exit(0);

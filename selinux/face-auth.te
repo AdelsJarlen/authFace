@@ -1,10 +1,26 @@
-module face_auth 1.0;
+module face_auth 1.1;
 
 require {
     type xdm_t;
     type v4l_device_t;
+    attribute file_type;
+    attribute non_security_file_type;
     class chr_file map;
+    class dir { getattr open read search write add_name remove_name };
+    class file { getattr open read write create rename unlink setattr lock ioctl map };
 }
 
 # Allow GDM/gdm-password (xdm_t) to mmap the IR camera for capture
 allow xdm_t v4l_device_t:chr_file map;
+
+# The template store, /var/lib/face-auth (labelled by deploy.sh). Under the
+# generic var_lib_t label xdm_t may only read, so the login and lock screen
+# could neither record a failed scan nor reset the counter after a successful
+# login, leaving face unlock paused for good. A type of its own lets xdm_t
+# manage files here without widening its access to the rest of /var/lib.
+# file_type keeps it reachable for unconfined root (sudo) and restorecon.
+type face_auth_var_lib_t;
+typeattribute face_auth_var_lib_t file_type, non_security_file_type;
+
+allow xdm_t face_auth_var_lib_t:dir { getattr open read search write add_name remove_name };
+allow xdm_t face_auth_var_lib_t:file { getattr open read write create rename unlink setattr lock ioctl map };

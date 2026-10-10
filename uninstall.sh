@@ -100,6 +100,13 @@ for service in sudo swaylock gdm-password gdm-fingerprint polkit-1; do
 done
 
 echo "Removing SELinux policy module..."
+# Relabel the store back to var_lib_t while the module's type still exists:
+# removing the module first would leave kept templates unlabeled.
+if semanage fcontext -d '/var/lib/face-auth(/.*)?' 2>/dev/null; then
+    if [ -d /var/lib/face-auth ]; then
+        restorecon -R /var/lib/face-auth
+    fi
+fi
 semodule -r face_auth 2>/dev/null || true
 
 echo "Removing login-screen indicator and status..."
