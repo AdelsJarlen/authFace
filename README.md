@@ -245,7 +245,7 @@ sudo ./deploy.sh
 | Models | Downloads InsightFace `buffalo_sc` once | `det_500m.onnx` (detector) and `w600k_mbf.onnx` (~13 MB, recognizer) to `/usr/local/share/face-auth/`, each SHA-256 verified |
 | Config | Installs default config | `/etc/face-auth.toml` |
 | PAM | Patches PAM service files | Adds `sufficient` `pam_exec.so quiet` to `sudo`, `gdm-password`, `swaylock`, `polkit-1`, plus an `account optional` line that resets the lockout counter |
-| polkit | Copies `/usr/lib/pam.d/polkit-1` to `/etc/pam.d` | Plus a `polkit-agent-helper@.service` drop-in that lets the helper open the IR camera |
+| Vendor stacks | Copies `polkit-1` (and, on Fedora 45+, `gdm-password` / `gdm-fingerprint`) from `/usr/lib/pam.d` to `/etc/pam.d` when no `/etc` copy exists | Plus a `polkit-agent-helper@.service` drop-in that lets the helper open the IR camera |
 | Status dir | `/etc/tmpfiles.d/face-auth.conf` | Creates `/run/face-auth` at boot, labelled `xdm_var_run_t` |
 | SELinux | Compiles and loads policy | Allows `xdm_t` to mmap camera for lock-screen auth |
 | Storage | Creates embeddings directory | `/var/lib/face-auth/<user>/` with sticky bit |
@@ -437,7 +437,7 @@ home directory, so `install-greeter.sh` installs to
 `/usr/share/gnome-shell/extensions/` and enables the extension in GDM's dconf
 database. It removes a per-user copy, which would otherwise shadow it.
 Remove with `sudo extensions/authface-scan-indicator/install-greeter.sh --remove`.
-Requires GNOME Shell 45–50.
+Requires GNOME Shell 45–51.
 
 ## How It Works
 
@@ -584,6 +584,17 @@ landmarks and the aligned crop as PNGs):
 cargo run --release -p face-auth-core --example align-probe -- \
   /dev/video2 /usr/local/share/face-auth/det_500m.onnx . 3
 ```
+
+### Face unlock stopped at the login/lock screen after upgrading to Fedora 45
+
+Fedora 45's `gdm` ships `gdm-password` and `gdm-fingerprint` in
+`/usr/lib/pam.d` only, and the upgrade renames patched `/etc/pam.d` copies to
+`.rpmsave`. `sudo` and admin prompts keep working; the login and lock screen
+fall back to password. Re-run `sudo ./deploy.sh` (it copies the new vendor
+files and adds the lines) and `sudo extensions/authface-scan-indicator/install-greeter.sh`
+for GNOME 51, then log out. The `.rpmsave` files are the old versions and can
+be deleted. While installed, the `/etc` copies hide later vendor changes to
+these files, as with polkit.
 
 ### No animation on the login screen, but only after a reboot
 
