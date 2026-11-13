@@ -219,13 +219,17 @@ fi
 # ---- PAM setup ----
 echo "Installing PAM configs..."
 
-# polkit (GUI admin prompts) ships its stack in /usr/lib/pam.d. A file in
-# /etc/pam.d replaces it entirely, so start from a copy of the vendor file and
+# Some services ship their stack in /usr/lib/pam.d only: polkit (GUI admin
+# prompts) and, from Fedora 45, GDM's login and lock screen. A file in
+# /etc/pam.d replaces the vendor one entirely, so start from a copy of it and
 # leave a marker so uninstall.sh deletes it rather than restoring a "backup".
-if [ ! -f "$PAM_DIR/polkit-1" ] && [ -f /usr/lib/pam.d/polkit-1 ]; then
-    cp /usr/lib/pam.d/polkit-1 "$PAM_DIR/polkit-1"
-    touch "$PAM_DIR/polkit-1.face-auth.created"
-fi
+for service in polkit-1 gdm-password gdm-fingerprint; do
+    if [ ! -f "$PAM_DIR/$service" ] && [ -f "/usr/lib/pam.d/$service" ]; then
+        cp "/usr/lib/pam.d/$service" "$PAM_DIR/$service"
+        touch "$PAM_DIR/$service.face-auth.created"
+        echo "Copied /usr/lib/pam.d/$service to $PAM_DIR (vendor stack)"
+    fi
+done
 
 for service in sudo swaylock gdm-password polkit-1; do
     conf="$PAM_DIR/$service"
